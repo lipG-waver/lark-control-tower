@@ -27,10 +27,11 @@ def clip(s, n=44):
 
 
 def main():
-    tasks, cache_ts = [], ""
+    tasks, projects, cache_ts = [], [], ""
     if CACHE.exists():
         c = json.loads(CACHE.read_text())
         tasks = c.get("tasks", [])
+        projects = c.get("projects", [])
         cache_ts = c.get("ts", "")[:16].replace("T", " ")
     now = datetime.now()
     p0 = [t for t in tasks if (t.get("prio") or "").startswith("P0")
@@ -50,6 +51,20 @@ def main():
     print(f"⌨️ 交给 Claude… | bash={ASK} terminal=false {FONT}")
     print(f"🖥 打开掌控台 | href=http://127.0.0.1:{PORT}/ {FONT}")
     print("---")
+    if projects:
+        by_line = {}
+        for p in projects:
+            by_line.setdefault(p.get("line", "其他"), []).append(p)
+        print(f"🗺 战线 ({len(by_line)}) | {FONT}")
+        for line in sorted(by_line, key=lambda l: -sum(x.get("alive", 0)
+                                                       for x in by_line[l])):
+            ps = by_line[line]
+            alive = sum(x.get("alive", 0) for x in ps)
+            print(f"-- {line} · {alive} 条活任务 | {FONT}")
+            for p in sorted(ps, key=lambda x: -x.get("alive", 0)):
+                print(f"---- [{p.get('stage') or '—'}] {clip(p['title'], 34)} "
+                      f"{p.get('done', 0)}/{p.get('total', 0)} | href={BASE_URL} {FONT}")
+        print("---")
     if p0:
         print(f"🔴 P0 命门 ({len(p0)}) | {FONT} color=#c0563f")
         for t in p0:

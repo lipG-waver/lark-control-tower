@@ -49,33 +49,37 @@ def flat_text(v):
 
 
 def fetch_feishu():
-    body = {
-        "page_size": 500,
-        "filter": {
-            "conjunction": "and",
-            "conditions": [
-                {"field_name": F["status"], "operator": "isNot", "value": [s]}
-                for s in CFG["feishu"]["closed_statuses"]
-            ],
-        },
-    }
-    cmd = [
-        "lark-cli", "api", "POST",
-        f"/open-apis/bitable/v1/apps/{CFG['feishu']['app_token']}"
-        f"/tables/{CFG['feishu']['table_id']}/records/search",
-        "--data", json.dumps(body, ensure_ascii=False), "--as", "bot",
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    d = json.loads(r.stdout)
-    if d.get("code") != 0:
-        raise RuntimeError(f"lark code={d.get('code')} {d.get('msg')}")
-    tasks = []
-    for it in d["data"]["items"]:
+    """拉全量记录（含已完成，分页）——项目进度条需要完成的子任务计数。"""
+    records, page_token = [], None
+    while True:
+        body = {"page_size": 500}
+        if page_token:
+            body["page_token"] = page_token
+        cmd = [
+            "lark-cli", "api", "POST",
+            f"/open-apis/bitable/v1/apps/{CFG['feishu']['app_token']}"
+            f"/tables/{CFG['feishu']['table_id']}/records/search",
+            "--data", json.dumps(body, ensure_ascii=False), "--as", "bot",
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        d = json.loads(r.stdout)
+        if d.get("code") != 0:
+            raise RuntimeError(f"lark code={d.get('code')} {d.get('msg')}")
+        records += d["data"]["items"]
+        if not d["data"].get("has_more"):
+            break
+        page_token = d["data"].get("page_token")
+    parent_f = F.get("parent", "父记录")
+    level_f = F.get("level", "层级")
+    stage_f = F.get("stage", "阶段")
+    out = []
+    for it in records:
         f = it["fields"]
         title = flat_text(f.get(F["title"])).strip()
         if not title:
             continue
-        tasks.append({
+        parent = (f.get(parent_f) or {}).get("link_record_ids") or []
+        out.append({
             "title": title,
             "status": f.get(F["status"]) or ST["todo"],
             "prio": f.get(F["priority"]),
@@ -84,9 +88,39 @@ def fetch_feishu():
                               for u in (f.get(F["owner"]) or [])),
             "ddl": f.get(F["ddl"]),
             "note": flat_text(f.get(F["note"])).strip(),
+            "level": f.get(level_f),
+            "stage": f.get(stage_f),
+            "parent": parent[0] if parent else None,
             "rid": it["record_id"],
         })
-    return tasks
+    return out
+
+
+def split_records(records):
+    """全量记录 → (项目列表, 活任务列表)。项目带子任务进度统计。"""
+    closed = set(CFG["feishu"]["closed_statuses"])
+    done_status = CFG["feishu"].get("done_status", "已完成")
+    project_level = CFG["feishu"].get("level_names", {}).get("project", "项目")
+    projects = {r["rid"]: {**r, "total": 0, "done": 0, "alive": 0,
+                           "child_ddl": None}
+                for r in records if r["level"] == project_level}
+    tasks = []
+    for r in records:
+        if r["level"] == project_level:
+            continue
+        p = projects.get(r["parent"])
+        if p is not None:
+            if r["status"] == done_status:
+                p["total"] += 1
+                p["done"] += 1
+            elif r["status"] not in closed:
+                p["total"] += 1
+                p["alive"] += 1
+                if r["ddl"] and (p["child_ddl"] is None or r["ddl"] < p["child_ddl"]):
+                    p["child_ddl"] = r["ddl"]
+        if r["status"] not in closed:
+            tasks.append(r)
+    return list(projects.values()), tasks
 
 
 def parse_todo_md():
@@ -141,7 +175,52 @@ def task_row(t, now):
             f'{ddl_badge(t["ddl"], now)}{owner}</div>{note_html}</div>')
 
 
-def render(tasks, todo_items, todo_long, now, stale_msg=""):
+STAGE_COLOR = {"构想": "px", "搭建": "p2", "验收": "p1", "上线": "p3",
+               "运维": "p3", "等外部": "px"}
+
+
+def last_milestone(note):
+    lines = [ln.strip() for ln in note.splitlines()
+             if ln.strip() and "——" not in ln]
+    return lines[-1] if lines else ""
+
+
+def render_lines_section(projects, now):
+    if not projects:
+        return ""
+    by_line = {}
+    for p in projects:
+        by_line.setdefault(p["line"], []).append(p)
+    order = CFG.get("lines_order") or sorted(
+        by_line, key=lambda l: -sum(x["alive"] for x in by_line[l]))
+    blocks = []
+    for line in order:
+        ps = by_line.get(line)
+        if not ps:
+            continue
+        cards = []
+        for p in sorted(ps, key=lambda x: -x["alive"]):
+            pct = int(p["done"] / p["total"] * 100) if p["total"] else 0
+            stage = (f'<span class="pr {STAGE_COLOR.get(p["stage"], "px")}">'
+                     f'{esc(p["stage"] or "—")}</span>')
+            ms = last_milestone(p["note"])
+            ms_html = f'<div class="mm nt">{esc(ms[:90])}</div>' if ms else ""
+            cards.append(
+                f'<div class="mini"><div class="mt">{stage}{esc(p["title"])}'
+                f'<span class="mm"> · {p["done"]}/{p["total"]}</span>'
+                f'{ddl_badge(p["child_ddl"], now)}</div>'
+                f'<div class="bar"><i style="width:{pct}%"></i></div>{ms_html}</div>')
+        blocks.append(
+            f'<div class="card"><div class="linehead">{esc(line)}'
+            f'<span class="mm"> · {len(ps)} 个项目 · '
+            f'{sum(p["alive"] for p in ps)} 条活任务</span></div>'
+            + "".join(cards) + "</div>")
+    return (f'<section><div class="sh"><h2>🗺 战线</h2>'
+            f'<span class="sub">每条线各推到哪了 · 进度=已完成/全部子任务</span></div>'
+            + "".join(blocks) + "</section>")
+
+
+def render(tasks, projects, todo_items, todo_long, now, stale_msg=""):
     p0 = [t for t in tasks if (t["prio"] or "").startswith("P0")
           and t["status"] != ST["paused"]]
     review = [t for t in tasks if t["status"] == ST["review"]]
@@ -213,6 +292,7 @@ def render(tasks, todo_items, todo_long, now, stale_msg=""):
     ts_str = now.strftime("%Y-%m-%d %H:%M")
     weekday = "一二三四五六日"[now.weekday()]
     port = CFG["port"]
+    lines_html = render_lines_section(projects, now)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
@@ -275,6 +355,9 @@ details summary .chev{{color:var(--mut);font-size:11px;transition:.2s}}
 details[open] summary .chev{{transform:rotate(90deg)}}
 .cnt{{background:#efece5;color:#7a756b;font-size:12px;border-radius:10px;
 padding:0 8px;font-weight:700}}
+.bar{{height:5px;background:#efece5;border-radius:3px;margin-top:6px;overflow:hidden}}
+.bar i{{display:block;height:100%;background:var(--green);border-radius:3px}}
+.linehead{{font-weight:700;font-size:15px;padding:10px 0 4px}}
 footer{{margin-top:40px;color:var(--mut);font-size:12.5px;text-align:center;
 border-top:1px solid var(--line);padding-top:18px;line-height:1.9}}
 footer a{{color:var(--mut)}}
@@ -293,6 +376,8 @@ footer a{{color:var(--mut)}}
 <span class="pill p-grey"><span class="n">{len(todo)}</span> 待办</span>
 <span class="pill p-grey"><span class="n">{len(paused)}</span> 暂停</span>
 </div></div>
+
+{lines_html}
 
 <section><div class="sh"><h2>🔴 P0 · 命门级</h2></div>
 <div class="card red">{focus_rows or '<div class="mini mm">当前没有 P0</div>'}</div></section>
@@ -355,21 +440,24 @@ def main():
     now = datetime.now()
     stale_msg = ""
     try:
-        tasks = fetch_feishu()
-        CACHE.write_text(json.dumps({"ts": now.isoformat(), "tasks": tasks},
-                                    ensure_ascii=False))
+        records = fetch_feishu()
+        projects, tasks = split_records(records)
+        CACHE.write_text(json.dumps(
+            {"ts": now.isoformat(), "tasks": tasks, "projects": projects},
+            ensure_ascii=False))
     except Exception as e:
         if CACHE.exists():
             c = json.loads(CACHE.read_text())
-            tasks = c["tasks"]
+            tasks, projects = c["tasks"], c.get("projects", [])
             stale_msg = f"飞书拉取失败（{e}），显示的是 {c['ts'][:16]} 的缓存数据"
         else:
             print(f"fetch failed and no cache: {e}", file=sys.stderr)
             sys.exit(1)
     todo_items, todo_long = parse_todo_md()
     out = Path(CFG["output"])
-    out.write_text(render(tasks, todo_items, todo_long, now, stale_msg))
-    print(f"ok {out} tasks={len(tasks)} md={len(todo_items)} stale={bool(stale_msg)}")
+    out.write_text(render(tasks, projects, todo_items, todo_long, now, stale_msg))
+    print(f"ok {out} projects={len(projects)} tasks={len(tasks)} "
+          f"md={len(todo_items)} stale={bool(stale_msg)}")
 
 
 if __name__ == "__main__":

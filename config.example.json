@@ -10,16 +10,22 @@
       "line": "业务线",
       "owner": "认领人",
       "ddl": "截止日期",
-      "note": "详情备注"
+      "note": "详情备注",
+      "parent": "父记录",
+      "level": "层级",
+      "stage": "阶段"
     },
     "closed_statuses": ["已完成", "取消"],
+    "done_status": "已完成",
     "status_names": {
       "todo": "待办",
       "doing": "进行中",
       "review": "待审",
       "paused": "暂停"
-    }
+    },
+    "level_names": { "project": "项目" }
   },
+  "lines_order": null,
   "todo_md": "",
   "output": "dashboard.html",
   "claude_workdir": "~",
