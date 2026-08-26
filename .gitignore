@@ -1,0 +1,6 @@
+config.json
+cache.json
+dashboard.html
+*.log
+.DS_Store
+__pycache__/

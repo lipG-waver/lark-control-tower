@@ -1,0 +1,27 @@
+{
+  "feishu": {
+    "tenant": "yourcompany.feishu.cn",
+    "app_token": "你的多维表格 app_token（URL /base/ 后那串）",
+    "table_id": "tblXXXXXXXX",
+    "fields": {
+      "title": "任务标题",
+      "status": "状态",
+      "priority": "优先级",
+      "line": "业务线",
+      "owner": "认领人",
+      "ddl": "截止日期",
+      "note": "详情备注"
+    },
+    "closed_statuses": ["已完成", "取消"],
+    "status_names": {
+      "todo": "待办",
+      "doing": "进行中",
+      "review": "待审",
+      "paused": "暂停"
+    }
+  },
+  "todo_md": "",
+  "output": "dashboard.html",
+  "claude_workdir": "~",
+  "port": 8765
+}
