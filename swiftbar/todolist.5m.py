@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SwiftBar 插件：菜单栏战线视图（每 5 分钟刷新，只读本地缓存，不打网络）
 
-结构：战线为一等公民——每条战线顶层展开，线内先亮 P0/临期火警，
-再列项目（阶段+进度，子菜单=该项目的活任务），散活收进子菜单。
+结构：业务线为一等公民（=项目归属，单表单维度）——每条线顶层展开，
+线内先亮 P0/待审/临期火警，再直列进行中任务，待办/暂停收进子菜单。
 """
 import json
 import sys
@@ -24,8 +24,6 @@ ASK = REPO / "ask_claude.sh"
 RENDER = REPO / "render_console.py"
 PORT = CFG.get("port", 8765)
 FONT = "size=13"
-STAGE_ICON = {"构想": "💭", "搭建": "🔨", "验收": "🔍", "上线": "🚀",
-              "运维": "⚙️", "等外部": "⏳"}
 
 
 def clip(s, n=40):
@@ -33,11 +31,10 @@ def clip(s, n=40):
 
 
 def main():
-    tasks, projects, cache_ts = [], [], ""
+    tasks, cache_ts = [], ""
     if CACHE.exists():
         c = json.loads(CACHE.read_text())
         tasks = c.get("tasks", [])
-        projects = c.get("projects", [])
         cache_ts = c.get("ts", "")[:16].replace("T", " ")
     now = datetime.now()
     soon_ts = (now + timedelta(days=3)).timestamp() * 1000
@@ -57,39 +54,35 @@ def main():
     print(f"🖥 打开掌控台 | href=http://127.0.0.1:{PORT}/ {FONT}")
 
     lines = {}
-    for p in projects:
-        lines.setdefault(p.get("line", "其他"), {"projects": [], "tasks": []})["projects"].append(p)
     for t in tasks:
-        lines.setdefault(t.get("line", "其他"), {"projects": [], "tasks": []})["tasks"].append(t)
+        lines.setdefault(t.get("line", "其他"), []).append(t)
 
-    def alive_count(L):
-        return sum(1 for t in L["tasks"] if t["status"] != paused)
+    def alive_count(ts):
+        return sum(1 for t in ts if t["status"] != paused)
 
     for line in sorted(lines, key=lambda l: -alive_count(lines[l])):
-        L = lines[line]
-        hot = [t for t in L["tasks"] if is_hot(t)]
+        ts_line = lines[line]
+        hot = [t for t in ts_line if is_hot(t)]
         print("---")
         flame = f" · 🔴{len(hot)}" if hot else ""
-        print(f"{line} · {alive_count(L)} 活{flame} | {FONT} color=#555555")
+        print(f"{line} · {alive_count(ts_line)} 活{flame} | {FONT} color=#555555")
         for t in hot:
             mark = "🔴" if (t.get("prio") or "").startswith("P0") else (
                 "🟠" if t["status"] == ST["review"] else "⏰")
             d = datetime.fromtimestamp(t["ddl"] / 1000).strftime("%m/%d") if t.get("ddl") else ""
             print(f"{mark} {clip(t['title'], 36)} {d} | href={BASE_URL} {FONT} color=#c0563f")
-        for p in sorted(L["projects"], key=lambda x: -x.get("alive", 0)):
-            icon = STAGE_ICON.get(p.get("stage") or "", "▫️")
-            print(f"{icon} {clip(p['title'], 32)} · {p.get('done', 0)}/{p.get('total', 0)}"
-                  f" | href={BASE_URL} {FONT}")
-            kids = [t for t in L["tasks"] if t.get("parent") == p["rid"] and not is_hot(t)]
-            for t in kids:
-                pz = "⏸ " if t["status"] == paused else ""
-                print(f"-- {pz}{clip(t['title'])} | href={BASE_URL} {FONT}")
-        loose = [t for t in L["tasks"]
-                 if not any(t.get("parent") == p["rid"] for p in L["projects"])
-                 and not is_hot(t)]
-        if loose:
-            print(f"▫️ 散活 ({len(loose)}) | {FONT}")
-            for t in loose:
+        doing = [t for t in ts_line if t["status"] == ST["doing"] and not is_hot(t)]
+        for t in doing:
+            print(f"🔨 {clip(t['title'], 36)} | href={BASE_URL} {FONT}")
+        todo = [t for t in ts_line if t["status"] == ST["todo"] and not is_hot(t)]
+        if todo:
+            print(f"▫️ 待办 ({len(todo)}) | {FONT}")
+            for t in todo:
+                print(f"-- {clip(t['title'])} | href={BASE_URL} {FONT}")
+        pz = [t for t in ts_line if t["status"] == paused]
+        if pz:
+            print(f"⏸ 暂停 ({len(pz)}) | {FONT}")
+            for t in pz:
                 print(f"-- {clip(t['title'])} | href={BASE_URL} {FONT}")
 
     md_items, _ = parse_todo_md()

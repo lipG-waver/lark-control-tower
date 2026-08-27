@@ -49,7 +49,7 @@ def flat_text(v):
 
 
 def fetch_feishu():
-    """拉全量记录（含已完成，分页）——项目进度条需要完成的子任务计数。"""
+    """拉全量记录（含已完成，分页）——战线区的累计完成/最近完成需要已完成记录。"""
     records, page_token = [], None
     while True:
         body = {"page_size": 500}
@@ -69,16 +69,13 @@ def fetch_feishu():
         if not d["data"].get("has_more"):
             break
         page_token = d["data"].get("page_token")
-    parent_f = F.get("parent", "父记录")
-    level_f = F.get("level", "层级")
-    stage_f = F.get("stage", "阶段")
+    done_f = F.get("done_ts", "完成时间")
     out = []
     for it in records:
         f = it["fields"]
         title = flat_text(f.get(F["title"])).strip()
         if not title:
             continue
-        parent = (f.get(parent_f) or {}).get("link_record_ids") or []
         out.append({
             "title": title,
             "status": f.get(F["status"]) or ST["todo"],
@@ -88,39 +85,38 @@ def fetch_feishu():
                               for u in (f.get(F["owner"]) or [])),
             "ddl": f.get(F["ddl"]),
             "note": flat_text(f.get(F["note"])).strip(),
-            "level": f.get(level_f),
-            "stage": f.get(stage_f),
-            "parent": parent[0] if parent else None,
+            "done_ts": f.get(done_f),
             "rid": it["record_id"],
         })
     return out
 
 
 def split_records(records):
-    """全量记录 → (项目列表, 活任务列表)。项目带子任务进度统计。"""
+    """全量记录 → (业务线聚合列表, 活任务列表)。项目归属=业务线单选字段。"""
     closed = set(CFG["feishu"]["closed_statuses"])
     done_status = CFG["feishu"].get("done_status", "已完成")
-    project_level = CFG["feishu"].get("level_names", {}).get("project", "项目")
-    projects = {r["rid"]: {**r, "total": 0, "done": 0, "alive": 0,
-                           "child_ddl": None}
-                for r in records if r["level"] == project_level}
-    tasks = []
+    paused_status = CFG["feishu"]["status_names"].get("paused", "暂停")
+    lines, tasks = {}, []
     for r in records:
-        if r["level"] == project_level:
-            continue
-        p = projects.get(r["parent"])
-        if p is not None:
-            if r["status"] == done_status:
-                p["total"] += 1
-                p["done"] += 1
-            elif r["status"] not in closed:
-                p["total"] += 1
-                p["alive"] += 1
-                if r["ddl"] and (p["child_ddl"] is None or r["ddl"] < p["child_ddl"]):
-                    p["child_ddl"] = r["ddl"]
+        L = lines.setdefault(r["line"], {
+            "line": r["line"], "alive": 0, "doing": 0, "done": 0,
+            "child_ddl": None, "last_done": None, "last_done_ts": 0})
+        if r["status"] == done_status:
+            L["done"] += 1
+            ts = r.get("done_ts") or 0
+            if ts > L["last_done_ts"]:
+                L["last_done_ts"], L["last_done"] = ts, r["title"]
+        elif r["status"] == paused_status:
+            pass  # 暂停冻结：不计活任务
+        elif r["status"] not in closed:
+            L["alive"] += 1
+            if r["status"] == ST["doing"]:
+                L["doing"] += 1
+            if r["ddl"] and (L["child_ddl"] is None or r["ddl"] < L["child_ddl"]):
+                L["child_ddl"] = r["ddl"]
         if r["status"] not in closed:
             tasks.append(r)
-    return list(projects.values()), tasks
+    return [L for L in lines.values() if L["alive"] > 0], tasks
 
 
 def parse_todo_md():
@@ -175,52 +171,30 @@ def task_row(t, now):
             f'{ddl_badge(t["ddl"], now)}{owner}</div>{note_html}</div>')
 
 
-STAGE_COLOR = {"构想": "px", "搭建": "p2", "验收": "p1", "上线": "p3",
-               "运维": "p3", "等外部": "px"}
-
-
-def last_milestone(note):
-    lines = [ln.strip() for ln in note.splitlines()
-             if ln.strip() and "——" not in ln]
-    return lines[-1] if lines else ""
-
-
-def render_lines_section(projects, now):
-    if not projects:
+def render_lines_section(lines, now):
+    if not lines:
         return ""
-    by_line = {}
-    for p in projects:
-        by_line.setdefault(p["line"], []).append(p)
-    order = CFG.get("lines_order") or sorted(
-        by_line, key=lambda l: -sum(x["alive"] for x in by_line[l]))
-    blocks = []
-    for line in order:
-        ps = by_line.get(line)
-        if not ps:
-            continue
-        cards = []
-        for p in sorted(ps, key=lambda x: -x["alive"]):
-            pct = int(p["done"] / p["total"] * 100) if p["total"] else 0
-            stage = (f'<span class="pr {STAGE_COLOR.get(p["stage"], "px")}">'
-                     f'{esc(p["stage"] or "—")}</span>')
-            ms = last_milestone(p["note"])
-            ms_html = f'<div class="mm nt">{esc(ms[:90])}</div>' if ms else ""
-            cards.append(
-                f'<div class="mini"><div class="mt">{stage}{esc(p["title"])}'
-                f'<span class="mm"> · {p["done"]}/{p["total"]}</span>'
-                f'{ddl_badge(p["child_ddl"], now)}</div>'
-                f'<div class="bar"><i style="width:{pct}%"></i></div>{ms_html}</div>')
-        blocks.append(
-            f'<div class="card"><div class="linehead">{esc(line)}'
-            f'<span class="mm"> · {len(ps)} 个项目 · '
-            f'{sum(p["alive"] for p in ps)} 条活任务</span></div>'
-            + "".join(cards) + "</div>")
+    order = CFG.get("lines_order")
+    if order:
+        lines = sorted(lines, key=lambda L: (order.index(L["line"])
+                       if L["line"] in order else len(order), -L["alive"]))
+    else:
+        lines = sorted(lines, key=lambda L: -L["alive"])
+    cards = []
+    for L in lines:
+        last = (f'<div class="mm nt">最近完成：{esc(L["last_done"][:80])}</div>'
+                if L["last_done"] else "")
+        cards.append(
+            f'<div class="mini"><div class="mt">{esc(L["line"])}'
+            f'<span class="mm"> · {L["alive"]} 活（进行中 {L["doing"]}）'
+            f' · 累计完成 {L["done"]}</span>'
+            f'{ddl_badge(L["child_ddl"], now)}</div>{last}</div>')
     return (f'<section><div class="sh"><h2>🗺 战线</h2>'
-            f'<span class="sub">每条线各推到哪了 · 进度=已完成/全部子任务</span></div>'
-            + "".join(blocks) + "</section>")
+            f'<span class="sub">业务线=项目归属 · 每条线的活任务与最近推进</span></div>'
+            f'<div class="card">' + "".join(cards) + '</div></section>')
 
 
-def render(tasks, projects, todo_items, todo_long, now, stale_msg=""):
+def render(tasks, lines, todo_items, todo_long, now, stale_msg=""):
     p0 = [t for t in tasks if (t["prio"] or "").startswith("P0")
           and t["status"] != ST["paused"]]
     review = [t for t in tasks if t["status"] == ST["review"]]
@@ -292,7 +266,7 @@ def render(tasks, projects, todo_items, todo_long, now, stale_msg=""):
     ts_str = now.strftime("%Y-%m-%d %H:%M")
     weekday = "一二三四五六日"[now.weekday()]
     port = CFG["port"]
-    lines_html = render_lines_section(projects, now)
+    lines_html = render_lines_section(lines, now)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
@@ -441,22 +415,22 @@ def main():
     stale_msg = ""
     try:
         records = fetch_feishu()
-        projects, tasks = split_records(records)
+        lines, tasks = split_records(records)
         CACHE.write_text(json.dumps(
-            {"ts": now.isoformat(), "tasks": tasks, "projects": projects},
+            {"ts": now.isoformat(), "tasks": tasks, "lines": lines},
             ensure_ascii=False))
     except Exception as e:
         if CACHE.exists():
             c = json.loads(CACHE.read_text())
-            tasks, projects = c["tasks"], c.get("projects", [])
+            tasks, lines = c["tasks"], c.get("lines", [])
             stale_msg = f"飞书拉取失败（{e}），显示的是 {c['ts'][:16]} 的缓存数据"
         else:
             print(f"fetch failed and no cache: {e}", file=sys.stderr)
             sys.exit(1)
     todo_items, todo_long = parse_todo_md()
     out = Path(CFG["output"])
-    out.write_text(render(tasks, projects, todo_items, todo_long, now, stale_msg))
-    print(f"ok {out} projects={len(projects)} tasks={len(tasks)} "
+    out.write_text(render(tasks, lines, todo_items, todo_long, now, stale_msg))
+    print(f"ok {out} lines={len(lines)} tasks={len(tasks)} "
           f"md={len(todo_items)} stale={bool(stale_msg)}")
 
 
